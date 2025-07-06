@@ -3,3 +3,4 @@ openai
 pydantic
 pydantic_settings
 uvicorn
+python-dotenv
