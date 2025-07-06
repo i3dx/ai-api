@@ -53,7 +53,6 @@ docker run -d \
   -e PUID=1001 \
   -e PGID=1001 \
   --name ai_api \
-  --net=isolated_net \
   --restart unless-stopped \
   -p 8000:8000 \
   -e TZ=Asia/Shanghai \
