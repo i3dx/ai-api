@@ -57,7 +57,7 @@ docker run -d \
   -p 8000:8000 \
   -e TZ=Asia/Shanghai \
   --add-host=host.docker.internal:host-gateway \
-  --env-file ai-api/api.env \
+  --env-file api.env \
   ai-api
 ```
 
