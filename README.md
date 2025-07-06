@@ -23,8 +23,8 @@
 
 ### 环境要求
 
-- Python 3.9+
-- Docker (可选)
+- Python 3.10+
+- Docker 
 
 ### 📦 安装依赖
 
@@ -34,19 +34,30 @@ pip install -r requirements.txt
 
 ### ⚙️ 配置文件
 
-创建 `.env` 文件并配置以下参数：
+创建 `api.env` 文件并配置以下参数：
 
 ```env
 API_KEYS=["your-api-key-1","your-api-key-2"]
 ALLOWED_TOKENS=["your-access-token-1","your-access-token-2"]
 BASE_URL="https://api.openai.com/v1"
+THROTTLE_INTERVAL=3
 ```
 
 ### 🐳 Docker 部署
 
 ```bash
-docker build -t openai-comatible-balance .
-docker run -p 8000:8000 -d openai-comatible-balance
+docker build -t ai-api .
+docker run -d \
+  -e PUID=1001 \
+  -e PGID=1001 \
+  --name ai_api \
+  --net=isolated_net \
+  --restart unless-stopped \
+  -p 8000:8000 \
+  -e TZ=Asia/Shanghai \
+  --add-host=host.docker.internal:host-gateway \
+  --env-file ai-api/api.env \
+  ai-api
 ```
 
 ## 🔌 API 接口
