@@ -2,11 +2,14 @@ FROM python:3.10.12-slim
 
 WORKDIR /app
 
-COPY ./app/config.py /app/app/config.py
+COPY ./app /app/app
 COPY ./main.py /app/main.py
 COPY ./requirements.txt /app/requirements.txt
 
 RUN pip install --no-cache-dir -r requirements.txt
+
+# optional: support import from /app
+ENV PYTHONPATH=/app
 
 # Expose port
 EXPOSE 8000
