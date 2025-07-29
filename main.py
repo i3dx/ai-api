@@ -1,18 +1,17 @@
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import openai
 from typing import List, Optional
 import logging
 from itertools import cycle
 import asyncio
-import uvicorn
-from app import config
-from openai import RateLimitError
-import inspect
+import httpx
+import openai  # 当前默认使用 openai 客户端结构，也可以换成自定义工厂
 
-# 配置日志
+from app import config
+
+# 日志配置
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -20,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# 允许跨域
+# 跨域配置
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -29,7 +28,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API密钥配置
+# API key 配置
 API_KEYS = config.settings.API_KEYS
 key_cycle = cycle(API_KEYS)
 key_lock = asyncio.Lock()
@@ -37,6 +36,7 @@ THROTTLE_INTERVAL = config.settings.THROTTLE_INTERVAL
 proxy_queue = asyncio.Queue()
 
 
+# ===== 请求体模型 =====
 class ChatRequest(BaseModel):
     messages: List[dict]
     model: str = "llama-3.2-90b-text-preview"
@@ -56,6 +56,7 @@ class EmbeddingRequest(BaseModel):
     response_format: Optional[str] = "float"
 
 
+# ===== 授权验证 =====
 async def verify_authorization(authorization: str = Header(None)):
     if not authorization:
         logger.error("Missing Authorization header")
@@ -70,6 +71,7 @@ async def verify_authorization(authorization: str = Header(None)):
     return token
 
 
+# ===== 启动节流队列 =====
 @app.on_event("startup")
 async def start_throttle_worker():
     asyncio.create_task(throttle_worker())
@@ -77,8 +79,7 @@ async def start_throttle_worker():
 
 async def throttle_worker():
     while True:
-        item = await proxy_queue.get()
-        request_func, params, future = item
+        request_func, params, future = await proxy_queue.get()
         try:
             result = await request_func(*params)
             future.set_result(result)
@@ -93,7 +94,8 @@ async def proxy_with_throttle(request_func, *params):
     return await future
 
 
-async def call_openai_with_retry(func, *args, **kwargs):
+# ===== 通用 Retry 调用封装 =====
+async def call_with_retry(func, *args, **kwargs):
     tried_keys = set()
     last_exception = None
 
@@ -104,27 +106,41 @@ async def call_openai_with_retry(func, *args, **kwargs):
         if api_key in tried_keys:
             continue
         tried_keys.add(api_key)
+
         try:
             client = openai.AsyncOpenAI(
                 api_key=api_key,
                 base_url=config.settings.BASE_URL,
-                max_retries=0
+                max_retries=0,
             )
             result = await func(client, *args, **kwargs)
             await asyncio.sleep(THROTTLE_INTERVAL)
             return result
-        except RateLimitError as e:
-            logger.warning(f"API key **********{api_key[-6:]} rate limited. Switching to next key.")
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            logger.warning(f"HTTP {status} error: {e.response.text}")
             last_exception = e
-            await asyncio.sleep(THROTTLE_INTERVAL)
-            continue
+            if status in [429, 503]:
+                await asyncio.sleep(THROTTLE_INTERVAL)
+                continue
+            raise HTTPException(status_code=status, detail=e.response.text)
+
         except Exception as e:
-            logger.error(f"OpenAI call error: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
-    logger.error("All API keys are rate limited.")
-    raise HTTPException(status_code=429, detail="All API keys are rate limited")
+            logger.error(f"Unexpected provider error: {str(e)}")
+            raise HTTPException(status_code=500, detail="Unexpected provider error.")
+
+    # 所有 key 都失败
+    if isinstance(last_exception, httpx.HTTPStatusError):
+        status = last_exception.response.status_code
+        if status == 429:
+            raise HTTPException(status_code=429, detail="All API keys are rate limited.")
+        if status == 503:
+            raise HTTPException(status_code=503, detail="Model is overloaded. Try again later.")
+    raise HTTPException(status_code=500, detail="All provider attempts failed.")
 
 
+# ===== 模型列表 =====
 @app.get("/v1/models")
 async def list_models(authorization: str = Header(None)):
     await verify_authorization(authorization)
@@ -132,18 +148,15 @@ async def list_models(authorization: str = Header(None)):
     async def list_func(client):
         return await client.models.list()
 
-    async def do_request():
-        return await call_openai_with_retry(list_func)
-
-    return await proxy_with_throttle(do_request)
+    return await proxy_with_throttle(call_with_retry, list_func)
 
 
+# ===== Chat Completions =====
 @app.post("/v1/chat/completions")
 async def chat_completion(request: ChatRequest, authorization: str = Header(None)):
     await verify_authorization(authorization)
 
     if request.stream:
-        # 流式请求：直接使用 AsyncOpenAI，不走节流队列
         async with key_lock:
             api_key = next(key_cycle)
         logger.info(f"Using API key (stream): **********{api_key[-6:]}")
@@ -154,13 +167,21 @@ async def chat_completion(request: ChatRequest, authorization: str = Header(None
             max_retries=0
         )
 
-        response = await client.chat.completions.create(
-            model=request.model,
-            messages=request.messages,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            stream=True,
-        )
+        try:
+            response = await client.chat.completions.create(
+                model=request.model,
+                messages=request.messages,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                stream=True,
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 503:
+                raise HTTPException(status_code=503, detail="Model is overloaded.")
+            raise HTTPException(status_code=e.response.status_code, detail=e.response.text)
+        except Exception as e:
+            logger.error(f"Streaming error: {str(e)}")
+            raise HTTPException(status_code=500, detail="Unexpected streaming error.")
 
         async def generate():
             async for chunk in response:
@@ -178,25 +199,24 @@ async def chat_completion(request: ChatRequest, authorization: str = Header(None
                 stream=False,
             )
 
-        async def do_request():
-            return await call_openai_with_retry(chat_func)
-
-        return await proxy_with_throttle(do_request)
+        return await proxy_with_throttle(call_with_retry, chat_func)
 
 
+# ===== Embeddings =====
 @app.post("/v1/embeddings")
 async def embedding(request: EmbeddingRequest, authorization: str = Header(None)):
     await verify_authorization(authorization)
 
     async def emb_func(client):
-        return await client.embeddings.create(input=request.input, model=request.model)
+        return await client.embeddings.create(
+            input=request.input,
+            model=request.model
+        )
 
-    async def do_request():
-        return await call_openai_with_retry(emb_func)
-
-    return await proxy_with_throttle(do_request)
+    return await proxy_with_throttle(call_with_retry, emb_func)
 
 
+# ===== 健康检查 =====
 @app.get("/health")
 async def health_check(authorization: str = Header(None)):
     await verify_authorization(authorization)
@@ -204,5 +224,6 @@ async def health_check(authorization: str = Header(None)):
     return {"status": "healthy"}
 
 
+# ===== 启动入口 =====
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
