@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     API_KEYS: List[str]
     ALLOWED_TOKENS: List[str]
     BASE_URL: str
-    THROTTLE_INTERVAL: int = 3  # 新增：默认值为3秒
+    THROTTLE_INTERVAL: float = 3.0  # 默认值为3秒
 
     class Config:
         env_file = ".env"
