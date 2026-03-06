@@ -6,7 +6,8 @@ class Settings(BaseSettings):
     API_KEYS: List[str]
     ALLOWED_TOKENS: List[str]
     BASE_URL: str
-    THROTTLE_INTERVAL: float = 3.0  # 默认值为3秒
+    GLOBAL_THROTTLE_INTERVAL: float = 1.0  # 全局最小发送间隔（秒）
+    KEY_THROTTLE_INTERVAL: float = 6.0     # 同一 Key 最小使用间隔（秒）
 
     class Config:
         env_file = ".env"
