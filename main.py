@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import logging
 import json
+from copy import deepcopy
 from itertools import cycle
 import asyncio
 import httpx
@@ -33,7 +34,11 @@ key_cycle = cycle(API_KEYS)
 key_lock = asyncio.Lock()
 GLOBAL_THROTTLE_INTERVAL = config.settings.GLOBAL_THROTTLE_INTERVAL
 KEY_THROTTLE_INTERVAL = config.settings.KEY_THROTTLE_INTERVAL
-BASE_URL = config.settings.BASE_URL
+BASE_URL = getattr(config.settings, "BASE_URL", None)
+BACKEND_MODE = getattr(config.settings, "BACKEND_MODE", None)
+
+if not BASE_URL:
+    raise RuntimeError("BASE_URL is required")
 
 # ===== 错误分组 =====
 RETRY_WITH_NEXT_KEY = {429, 401, 403}   # 该 Key 有问题，换一个可能好用
@@ -89,6 +94,108 @@ async def enforce_throttle(api_key: str):
 def should_retry(status_code: int) -> bool:
     """判断该状态码是否应该重试"""
     return status_code in RETRY_WITH_NEXT_KEY or status_code in RETRY_TRANSIENT
+
+
+def detect_backend_mode(body: dict) -> str:
+    """Resolve backend mode from explicit config first, then request model."""
+    if BACKEND_MODE in {"generic", "gemini"}:
+        return BACKEND_MODE
+
+    model = str(body.get("model") or "").strip().lower()
+    if model.startswith("gemini"):
+        return "gemini"
+
+    return "generic"
+
+
+def _content_to_text(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks = []
+        for item in content:
+            if isinstance(item, str):
+                chunks.append(item)
+                continue
+            if not isinstance(item, dict):
+                chunks.append(json.dumps(item, ensure_ascii=False))
+                continue
+
+            if item.get("type") == "text" and item.get("text"):
+                chunks.append(item["text"])
+            else:
+                chunks.append(json.dumps(item, ensure_ascii=False))
+        return "\n".join(chunk for chunk in chunks if chunk)
+    return json.dumps(content, ensure_ascii=False)
+
+
+def sanitize_gemini_messages(messages: list) -> list:
+    """
+    Rewrite tool-call history into plain text context.
+
+    Gemini requires provider-specific metadata such as thought_signature for
+    functionCall history. OpenAI-compatible agents do not send it back, so we
+    drop prior function-call records while preserving any assistant prose and
+    the tool outputs that followed.
+    """
+    sanitized = []
+    tool_call_name_by_id = {}
+
+    for message in messages:
+        role = message.get("role")
+
+        if role == "assistant" and message.get("tool_calls"):
+            content_text = _content_to_text(message.get("content"))
+
+            for tool_call in message.get("tool_calls", []):
+                function_data = tool_call.get("function") or {}
+                tool_name = function_data.get("name") or "tool"
+                tool_call_id = tool_call.get("id")
+                if tool_call_id:
+                    tool_call_name_by_id[tool_call_id] = tool_name
+
+            # Do not echo raw tool invocation payloads back into the message
+            # history. Keep only any natural-language assistant text.
+            if content_text:
+                sanitized.append({"role": "assistant", "content": content_text})
+            continue
+
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            tool_name = message.get("name") or tool_call_name_by_id.get(tool_call_id) or "tool"
+            tool_output = _content_to_text(message.get("content"))
+            sanitized.append(
+                {
+                    "role": "user",
+                    "content": f"Tool result from {tool_name}:\n{tool_output}",
+                }
+            )
+            continue
+
+        sanitized.append(message)
+
+    return sanitized
+
+
+def prepare_chat_body(body: dict) -> dict:
+    if detect_backend_mode(body) != "gemini":
+        return body
+
+    prepared = deepcopy(body)
+
+    if isinstance(prepared.get("messages"), list):
+        original_messages = prepared["messages"]
+        prepared["messages"] = sanitize_gemini_messages(original_messages)
+        if prepared["messages"] != original_messages:
+            logger.info("Sanitized tool-call history for Gemini-compatible backend")
+
+    if prepared.get("tools"):
+        # Gemini tool execution is more reliable when constrained to one call at a time.
+        prepared["parallel_tool_calls"] = False
+
+    return prepared
 
 # ===== 非流式请求的重试处理 =====
 async def call_with_retry(path: str, body: dict = None, method: str = "POST"):
@@ -245,6 +352,7 @@ async def list_models(authorization: str = Header(None)):
 async def chat_completion(request: Request, authorization: str = Header(None)):
     await verify_authorization(authorization)
     body = await request.json()
+    body = prepare_chat_body(body)
     is_stream = body.get("stream", False)
 
     if is_stream:
