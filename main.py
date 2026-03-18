@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import logging
 import json
+import time
 from copy import deepcopy
 from itertools import cycle
 import asyncio
@@ -34,6 +35,7 @@ key_cycle = cycle(API_KEYS)
 key_lock = asyncio.Lock()
 GLOBAL_THROTTLE_INTERVAL = config.settings.GLOBAL_THROTTLE_INTERVAL
 KEY_THROTTLE_INTERVAL = config.settings.KEY_THROTTLE_INTERVAL
+RPM_COOLDOWN_SECONDS = config.settings.RPM_COOLDOWN_SECONDS
 BASE_URL = getattr(config.settings, "BASE_URL", None)
 BACKEND_MODE = getattr(config.settings, "BACKEND_MODE", None)
 
@@ -48,6 +50,38 @@ RETRY_TRANSIENT = {500, 502, 503, 504, 408}  # 临时故障，重试可能好用
 global_last_send_time = 0       # 全局上次发送时间
 key_last_send_time = {}         # 每个 Key 的上次发送时间
 throttle_lock = asyncio.Lock()  # 节流锁，保证判断+等待+记录的原子性
+
+# ===== RPM 冷却状态 =====
+key_rpm_cooldown_until: dict[str, float] = {}  # {api_key: cooldown_expire_timestamp}
+
+
+def classify_429(response_text: str) -> str:
+    """
+    解析 429 响应体，区分限流类型：
+      'tpm'     - Token 用量超限（换 key 无意义，应立即失败）
+      'rpm'     - 请求频率超限（换 key 可能有效）
+      'unknown' - 无法判断，保守地继续重试
+    """
+    text_lower = response_text.lower()
+    # TPM / Quota 关键词优先判断
+    if any(k in text_lower for k in ["token", "quota", "tokens per", "tpm"]):
+        return "tpm"
+    # RPM 关键词
+    if any(k in text_lower for k in [
+        "rate limit", "rpm", "requests per minute",
+        "rate_limit_exceeded", "too many requests",
+    ]):
+        return "rpm"
+    return "unknown"
+
+
+def mark_rpm_cooldown(api_key: str):
+    """将 key 标记为 RPM 冷却状态，冷却期间尽量避免再次选用"""
+    expire = time.monotonic() + RPM_COOLDOWN_SECONDS
+    key_rpm_cooldown_until[api_key] = expire
+    logger.info(
+        f"Key **********{api_key[-6:]} marked RPM cooldown for {RPM_COOLDOWN_SECONDS}s"
+    )
 
 # ===== 授权验证 =====
 async def verify_authorization(authorization: str = Header(None)):
@@ -233,11 +267,33 @@ async def call_with_retry(path: str, body: dict = None, method: str = "POST"):
 
             # 判断是否可重试
             if should_retry(response.status_code):
-                error_type = "key-issue" if response.status_code in RETRY_WITH_NEXT_KEY else "transient"
-                logger.warning(
-                    f"HTTP {response.status_code} ({error_type}) with key **********{api_key[-6:]} "
-                    f"({len(tried_keys)}/{len(API_KEYS)} keys tried): {response.text[:200]}"
-                )
+                # --- 差异化处理 429 ---
+                if response.status_code == 429:
+                    kind = classify_429(response.text)
+                    retry_after = response.headers.get("retry-after", str(RPM_COOLDOWN_SECONDS))
+                    if kind == "tpm":
+                        logger.warning(
+                            f"TPM quota exceeded with key **********{api_key[-6:]}. "
+                            f"Retry-After: {retry_after}s. Stopping key rotation."
+                        )
+                        raise HTTPException(
+                            status_code=429,
+                            detail=f"Token quota exceeded. Please retry after {retry_after}s.",
+                            headers={"Retry-After": retry_after},
+                        )
+                    else:
+                        # RPM 或 unknown：标记冷却，继续换 key
+                        mark_rpm_cooldown(api_key)
+                        logger.warning(
+                            f"RPM rate limited (type={kind}) with key **********{api_key[-6:]} "
+                            f"({len(tried_keys)}/{len(API_KEYS)} keys tried)."
+                        )
+                else:
+                    error_type = "key-issue" if response.status_code in RETRY_WITH_NEXT_KEY else "transient"
+                    logger.warning(
+                        f"HTTP {response.status_code} ({error_type}) with key **********{api_key[-6:]} "
+                        f"({len(tried_keys)}/{len(API_KEYS)} keys tried): {response.text[:200]}"
+                    )
                 last_exception = httpx.HTTPStatusError(
                     f"HTTP {response.status_code}",
                     request=response.request,
@@ -318,11 +374,33 @@ async def call_streaming_with_retry(path: str, body: dict):
             await client.aclose()
 
             if should_retry(response.status_code):
-                error_type = "key-issue" if response.status_code in RETRY_WITH_NEXT_KEY else "transient"
-                logger.warning(
-                    f"HTTP {response.status_code} ({error_type}) in streaming with key **********{api_key[-6:]} "
-                    f"({len(tried_keys)}/{len(API_KEYS)} keys tried): {error_body.decode()[:200]}"
-                )
+                # --- 差异化处理 429 ---
+                if response.status_code == 429:
+                    kind = classify_429(error_body.decode())
+                    retry_after = response.headers.get("retry-after", str(RPM_COOLDOWN_SECONDS))
+                    if kind == "tpm":
+                        logger.warning(
+                            f"[Stream] TPM quota exceeded with key **********{api_key[-6:]}. "
+                            f"Retry-After: {retry_after}s. Stopping key rotation."
+                        )
+                        raise HTTPException(
+                            status_code=429,
+                            detail=f"Token quota exceeded. Please retry after {retry_after}s.",
+                            headers={"Retry-After": retry_after},
+                        )
+                    else:
+                        # RPM 或 unknown：标记冷却，继续换 key
+                        mark_rpm_cooldown(api_key)
+                        logger.warning(
+                            f"[Stream] RPM rate limited (type={kind}) with key **********{api_key[-6:]} "
+                            f"({len(tried_keys)}/{len(API_KEYS)} keys tried)."
+                        )
+                else:
+                    error_type = "key-issue" if response.status_code in RETRY_WITH_NEXT_KEY else "transient"
+                    logger.warning(
+                        f"HTTP {response.status_code} ({error_type}) in streaming with key **********{api_key[-6:]} "
+                        f"({len(tried_keys)}/{len(API_KEYS)} keys tried): {error_body.decode()[:200]}"
+                    )
                 continue  # enforce_throttle 会自动控制间隔
             else:
                 logger.error(

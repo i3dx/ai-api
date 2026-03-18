@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     BACKEND_MODE: Optional[Literal["generic", "gemini"]] = None
     GLOBAL_THROTTLE_INTERVAL: float = 1.0  # 全局最小发送间隔（秒）
     KEY_THROTTLE_INTERVAL: float = 6.0     # 同一 Key 最小使用间隔（秒）
+    RPM_COOLDOWN_SECONDS: float = 60.0     # RPM 429 触发后该 key 的冷却时长（秒）
 
     class Config:
         env_file = ".env"
