@@ -338,6 +338,8 @@ async def call_streaming_with_retry(path: str, body: dict):
     """流式请求：透传 body 到上游 API，返回 httpx 流式响应和使用的 API key"""
     tried_keys = set()
 
+    last_exception = None
+
     while len(tried_keys) < len(API_KEYS):
         async with key_lock:
             api_key = next(key_cycle)
@@ -401,6 +403,11 @@ async def call_streaming_with_retry(path: str, body: dict):
                         f"HTTP {response.status_code} ({error_type}) in streaming with key **********{api_key[-6:]} "
                         f"({len(tried_keys)}/{len(API_KEYS)} keys tried): {error_body.decode()[:200]}"
                     )
+                last_exception = httpx.HTTPStatusError(
+                    f"HTTP {response.status_code}",
+                    request=response.request,
+                    response=response,
+                )
                 continue  # enforce_throttle 会自动控制间隔
             else:
                 logger.error(
@@ -415,9 +422,19 @@ async def call_streaming_with_retry(path: str, body: dict):
             logger.error(f"Unexpected streaming error with key **********{api_key[-6:]}: {str(e)}")
             continue
 
-    # 所有 key 都失败
+    # 所有 key 都失败，按实际错误码分类返回
     logger.error(f"All {len(API_KEYS)} API keys exhausted for streaming. Tried: {len(tried_keys)}")
-    raise HTTPException(status_code=429, detail=f"All {len(API_KEYS)} API keys failed for streaming request. Please try again later.")
+
+    if isinstance(last_exception, httpx.HTTPStatusError):
+        status = last_exception.response.status_code
+        if status == 429:
+            raise HTTPException(status_code=429, detail=f"All {len(API_KEYS)} API keys are rate limited. Please try again later.")
+        elif status in {503, 502, 500, 504}:
+            raise HTTPException(status_code=status, detail="Service temporarily unavailable. Try again later.")
+        elif status in {401, 403}:
+            raise HTTPException(status_code=status, detail=f"All {len(API_KEYS)} API keys failed authentication/authorization.")
+
+    raise HTTPException(status_code=500, detail="All provider attempts failed.")
 
 # ===== 模型列表 =====
 @app.get("/v1/models")
