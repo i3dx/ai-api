@@ -43,8 +43,8 @@ if not BASE_URL:
     raise RuntimeError("BASE_URL is required")
 
 # ===== 错误分组 =====
-RETRY_WITH_NEXT_KEY = {429, 401, 403}   # 该 Key 有问题，换一个可能好用
-RETRY_TRANSIENT = {500, 502, 503, 504, 408}  # 临时故障，重试可能好用
+RETRY_WITH_NEXT_KEY = {429}   # 仅对明确可识别的限频场景继续轮询 Key
+RETRY_TRANSIENT = set()  # 其它错误直接返回上游结果，不再重试
 
 # ===== 节流状态（基于发送时间） =====
 global_last_send_time = 0       # 全局上次发送时间
@@ -60,7 +60,7 @@ def classify_429(response_text: str) -> str:
     解析 429 响应体，区分限流类型：
       'tpm'     - Token 用量超限（换 key 无意义，应立即失败）
       'rpm'     - 请求频率超限（换 key 可能有效）
-      'unknown' - 无法判断，保守地继续重试
+      'unknown' - 无法判断，不继续轮询，直接将结果返回下游
     """
     text_lower = response_text.lower()
     # TPM / Quota 关键词优先判断
@@ -126,7 +126,7 @@ async def enforce_throttle(api_key: str):
 
 # ===== 错误分类判断 =====
 def should_retry(status_code: int) -> bool:
-    """判断该状态码是否应该重试"""
+    """判断该状态码是否应该进入重试逻辑"""
     return status_code in RETRY_WITH_NEXT_KEY or status_code in RETRY_TRANSIENT
 
 
@@ -281,12 +281,22 @@ async def call_with_retry(path: str, body: dict = None, method: str = "POST"):
                             detail=f"Token quota exceeded. Please retry after {retry_after}s.",
                             headers={"Retry-After": retry_after},
                         )
-                    else:
-                        # RPM 或 unknown：标记冷却，继续换 key
+                    elif kind == "rpm":
+                        # 明确识别为 RPM 限频时，才标记冷却并继续换 key
                         mark_rpm_cooldown(api_key)
                         logger.warning(
                             f"RPM rate limited (type={kind}) with key **********{api_key[-6:]} "
                             f"({len(tried_keys)}/{len(API_KEYS)} keys tried)."
+                        )
+                    else:
+                        logger.warning(
+                            f"Unclassified 429 with key **********{api_key[-6:]}; "
+                            "returning upstream response without retrying."
+                        )
+                        raise HTTPException(
+                            status_code=429,
+                            detail=response.text,
+                            headers={"Retry-After": retry_after} if "retry-after" in response.headers else None,
                         )
                 else:
                     error_type = "key-issue" if response.status_code in RETRY_WITH_NEXT_KEY else "transient"
@@ -390,12 +400,22 @@ async def call_streaming_with_retry(path: str, body: dict):
                             detail=f"Token quota exceeded. Please retry after {retry_after}s.",
                             headers={"Retry-After": retry_after},
                         )
-                    else:
-                        # RPM 或 unknown：标记冷却，继续换 key
+                    elif kind == "rpm":
+                        # 明确识别为 RPM 限频时，才标记冷却并继续换 key
                         mark_rpm_cooldown(api_key)
                         logger.warning(
                             f"[Stream] RPM rate limited (type={kind}) with key **********{api_key[-6:]} "
                             f"({len(tried_keys)}/{len(API_KEYS)} keys tried)."
+                        )
+                    else:
+                        logger.warning(
+                            f"[Stream] Unclassified 429 with key **********{api_key[-6:]}; "
+                            "returning upstream response without retrying."
+                        )
+                        raise HTTPException(
+                            status_code=429,
+                            detail=error_body.decode(),
+                            headers={"Retry-After": retry_after} if "retry-after" in response.headers else None,
                         )
                 else:
                     error_type = "key-issue" if response.status_code in RETRY_WITH_NEXT_KEY else "transient"
